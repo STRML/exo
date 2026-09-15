@@ -26,7 +26,7 @@ from transformers import AutoTokenizer
 import exo.worker.engines.mlx.generator.batch_generate  # noqa: F401
 from exo.shared.types.common import ModelId
 from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
-from exo.worker.engines.mlx.cache import encode_prompt, make_kv_cache
+from exo.worker.engines.mlx.cache import KVPrefixCache, encode_prompt, make_kv_cache
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import PrefillCancelled, prefill
 from exo.worker.engines.mlx.types import Model
@@ -164,6 +164,28 @@ def _make_tokenizer() -> TokenizerWrapper:
     return TokenizerWrapper(hf_tokenizer)
 
 
+class _TinyTokenizer:
+    """Self-contained tokenizer for scheduler tests."""
+
+    eos_token_id = 255
+    chat_template = None
+    clean_up_tokenization_spaces = False
+
+    def get_vocab(self) -> dict[str, int]:
+        return {chr(i): i for i in range(256)}
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [(ord(char) % 254) + 1 for char in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(97 + token % 26) for token in tokens)
+
+
+def _make_tiny_tokenizer() -> TokenizerWrapper:
+    return TokenizerWrapper(_TinyTokenizer(), eos_token_ids=[255])
+
+
 @pytest.mark.slow
 def test_batch_b2_llama() -> None:
     """Llama-style model (KVCache only) must produce bit-exact logits in B=2.
@@ -271,7 +293,6 @@ def test_batch_b2_qwen35_moe() -> None:
     assert max_diff < 0.002, f"Qwen3.5 MoE B=2 max logit diff: {max_diff}"
 
 
-@pytest.mark.slow
 def test_new_prompt_prefill_does_not_block_active_decode() -> None:
     """A newly admitted prompt must be prefilled incrementally.
 
@@ -286,24 +307,24 @@ def test_new_prompt_prefill_does_not_block_active_decode() -> None:
     model = LlamaModel(
         ModelArgs(
             model_type="llama",
-            hidden_size=128,
+            hidden_size=64,
             num_hidden_layers=2,
-            intermediate_size=256,
+            intermediate_size=128,
             num_attention_heads=4,
             num_key_value_heads=2,
             rms_norm_eps=1e-6,
-            vocab_size=248320,
+            vocab_size=256,
             rope_theta=10000.0,
             tie_word_embeddings=True,
         )
     )
     _init_random(model)
-    tokenizer = _make_tokenizer()
+    tokenizer = _make_tiny_tokenizer()
     generator = ExoBatchGenerator(
         model=cast(Model, model),
         tokenizer=tokenizer,
         group=None,
-        kv_prefix_cache=None,
+        kv_prefix_cache=KVPrefixCache(None),
         interleaved_prefill_step_size=4,
     )
 
@@ -311,8 +332,9 @@ def test_new_prompt_prefill_does_not_block_active_decode() -> None:
         return TextGenerationTaskParams(
             model=ModelId("test/llama"),
             input=[InputMessage(role="user", content=prompt)],
-            max_output_tokens=32,
+            max_output_tokens=128,
             bench=True,
+            use_prefix_cache=True,
         )
 
     first_uid = generator.submit(task("Decode continuously."), "Decode continuously.")
@@ -324,11 +346,20 @@ def test_new_prompt_prefill_does_not_block_active_decode() -> None:
     assert first_uid in {uid for uid, _ in warmup_results}
 
     progress: list[tuple[int, int]] = []
-    second_prompt = "A deliberately uncached prompt. " * 20
+    second_prompt = "A deliberately uncached prompt. " * 10
     second_uid = generator.submit(
         task(second_prompt),
         second_prompt,
         on_prefill_progress=lambda processed, total: progress.append(
+            (processed, total)
+        ),
+    )
+    waiting_progress: list[tuple[int, int]] = []
+    waiting_prompt = "A second queued prefill. " * 10
+    waiting_uid = generator.submit(
+        task(waiting_prompt),
+        waiting_prompt,
+        on_prefill_progress=lambda processed, total: waiting_progress.append(
             (processed, total)
         ),
     )
@@ -343,8 +374,9 @@ def test_new_prompt_prefill_does_not_block_active_decode() -> None:
     assert second_uid not in result_uids
     assert len(progress) == 1
     assert 0 < progress[0][0] < progress[0][1]
+    assert waiting_progress == []
 
-    for _ in range(64):
+    for _ in range(128):
         results = generator.step()
         if second_uid in {uid for uid, _ in results}:
             break
@@ -354,6 +386,19 @@ def test_new_prompt_prefill_does_not_block_active_decode() -> None:
     assert len(progress) > 1
     assert progress[-1][0] == progress[-1][1]
     assert progress == sorted(progress)
+    assert waiting_progress
+    generator.cancel([waiting_uid])
+    assert generator.kv_prefix_cache is not None
+    assert len(generator.kv_prefix_cache.prompts) >= 2
+
+    cached_uid = generator.submit(task(second_prompt), second_prompt)
+    assert generator._active_tasks[cached_uid].prefix_cache_hit == "exact"
+    for _ in range(4):
+        results = generator.step()
+        if cached_uid in {uid for uid, _ in results}:
+            break
+    else:
+        pytest.fail("exact prefix-cache hit never reached decode")
 
     def cancel_during_prefill() -> None:
         raise PrefillCancelled()

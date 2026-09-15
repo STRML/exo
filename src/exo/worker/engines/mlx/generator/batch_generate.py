@@ -66,6 +66,7 @@ from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
+_PREFIX_CACHE_SNAPSHOT_STEP_SIZE = 4096
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
@@ -113,6 +114,7 @@ class _EngineTask:
     prefill_start_time: float = 0.0
     prefill_token_count: int = 0
     cache_snapshots: list[CacheSnapshot] = field(default_factory=list)
+    last_cache_snapshot_token_count: int = 0
     has_non_kv_cache: bool = False
     should_save_prefix_cache: bool = False
     min_prefix_hit_length: int = 1000
@@ -138,6 +140,9 @@ class ExoBatchGenerator:
         self._mlx_gen = MlxBatchGenerator(
             model=self.model,
             stop_tokens=[[t] for t in eos_ids_from_tokenizer(self.tokenizer)],
+            # Bound each scheduler iteration to one prompt chunk so several
+            # simultaneous arrivals cannot multiply the decode pause.
+            prefill_batch_size=1,
             prefill_step_size=4096,
         )
         self._step_count = 0
@@ -245,8 +250,8 @@ class ExoBatchGenerator:
         # processing one chunk of a newly submitted prompt. Use that path when
         # there is latency-sensitive decode work to protect. Pipeline-parallel
         # and vision prefills require EXO-specific setup that is still handled
-        # by the synchronous path below. Remote prefill already runs away from
-        # the decode worker and does not need local interleaving.
+        # by the synchronous path below. Remote prefill retains its existing
+        # transfer and cache-ingestion lifecycle.
         incremental_prefill = (
             bool(self._active_tasks)
             and vision is None
@@ -569,7 +574,8 @@ class ExoBatchGenerator:
         return results
 
     def _handle_prompt_responses(
-        self, responses: list[PromptProcessingBatch.Response]
+        self,
+        responses: list[PromptProcessingBatch.Response],
     ) -> None:
         for response in responses:
             uid = response.uid
@@ -593,7 +599,11 @@ class ExoBatchGenerator:
                 if state.on_prefill_progress is not None:
                     state.on_prefill_progress(processed, state.prefill_token_count)
 
-                if state.has_non_kv_cache:
+                should_snapshot = processed == state.prefill_token_count or (
+                    processed - state.last_cache_snapshot_token_count
+                    >= _PREFIX_CACHE_SNAPSHOT_STEP_SIZE
+                )
+                if state.has_non_kv_cache and should_snapshot:
                     extracted = cast(
                         tuple[KVCacheType, mx.array] | None,
                         self._mlx_gen.extract_cache([uid]).get(uid),
@@ -602,6 +612,7 @@ class ExoBatchGenerator:
                         state.cache_snapshots.append(
                             snapshot_ssm_states(extracted[0])
                         )
+                        state.last_cache_snapshot_token_count = processed
                 continue
 
             elapsed = time.perf_counter() - state.prefill_start_time
